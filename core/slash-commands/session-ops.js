@@ -4,6 +4,7 @@ import path from "path";
 /**
  * @typedef {{kind:'bridge'|'desktop', agentId:string, sessionKey?:string, sessionPath?:string}} SessionRef
  * @typedef {{status:'not-found'|'no-history'|'rotated'|'deleted'}} SessionOpResult
+ * @typedef {{status:'not-found'|'no-history'|'cleaned'|'no-messages'}} CleanByUserResult
  */
 
 export function createSessionOps({ engine }) {
@@ -73,6 +74,12 @@ export function createSessionOps({ engine }) {
         reason: "manual",
       });
     },
+
+    async cleanByUser(ref, userId) {
+      if (ref.kind !== "bridge") throw new Error("cleanByUser for desktop kind not supported in phase 1");
+      if (!userId) throw new Error("cleanByUser: userId required");
+      return _cleanByUserBridge(engine, ref, userId);
+    },
   };
 }
 
@@ -127,4 +134,65 @@ function _deleteBridge(engine, ref) {
   delete index[ref.sessionKey];
   engine.bridgeSessionManager.writeIndex(index, agent);
   return { status: "deleted" };
+}
+
+function _cleanByUserBridge(engine, ref, userId) {
+  const agent = engine.getAgent(ref.agentId);
+  if (!agent) throw new Error("agent not found");
+  const bridgeDir = path.join(agent.sessionDir, "bridge");
+  const index = engine.bridgeSessionManager.readIndex(agent);
+  const raw = index[ref.sessionKey];
+  if (!raw) return { status: "not-found" };
+  const entry = typeof raw === "string" ? { file: raw } : raw;
+  if (!entry.file) return { status: "no-history" };
+
+  const sessionPath = path.join(bridgeDir, entry.file);
+  if (!fs.existsSync(sessionPath)) return { status: "no-history" };
+
+  const content = fs.readFileSync(sessionPath, "utf-8");
+  const lines = content.split("\n").filter(l => l.trim());
+  const entries = [];
+  for (const line of lines) {
+    try {
+      entries.push(JSON.parse(line));
+    } catch {
+      entries.push(null);
+    }
+  }
+
+  const filtered = [];
+  let skipNext = false;
+  let removedCount = 0;
+
+  for (const entry of entries) {
+    if (!entry || entry.type !== "message") {
+      filtered.push(entry);
+      continue;
+    }
+
+    if (skipNext && entry.message?.role === "assistant") {
+      skipNext = false;
+      removedCount++;
+      continue;
+    }
+
+    if (entry.message?.role === "user" && entry.meta?.userId === userId) {
+      skipNext = true;
+      removedCount++;
+      continue;
+    }
+
+    filtered.push(entry);
+  }
+
+  if (removedCount === 0) return { status: "no-messages" };
+
+  // 删除原文件并从 index 中移除 file 引用，确保下次消息创建全新 session
+  // 这样能真正"重启上下文"，避免内存中残留旧上下文
+  fs.unlinkSync(sessionPath);
+  delete entry.file;
+  index[ref.sessionKey] = entry;
+  engine.bridgeSessionManager.writeIndex(index, agent);
+
+  return { status: "cleaned", removedCount };
 }

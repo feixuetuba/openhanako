@@ -58,6 +58,30 @@ export const bridgeCommands = [
     },
   },
   {
+    name: "clean",
+    description: "清除当前对话者的聊天历史，避免上下文污染",
+    scope: "session",
+    permission: "owner",
+    source: "core",
+    handler: async (ctx) => {
+      // Phase 2-E：接管态下拒绝
+      if (_isAttached(ctx)) {
+        return { reply: "接管桌面会话期间禁止使用 /clean，请先 /exitrc 退出接管" };
+      }
+      // 群聊场景：只清除当前用户的消息
+      // 私聊场景：等同于 /reset，清除整个会话
+      const userId = ctx.senderId;
+      if (!userId) {
+        return { reply: "无法识别当前用户，请使用 /reset 彻底重置会话" };
+      }
+      const res = await ctx.sessionOps.cleanByUser(ctx.sessionRef, userId);
+      if (res.status === "not-found") return { reply: "未找到当前会话" };
+      if (res.status === "no-history") return { reply: "当前会话无历史记录" };
+      if (res.status === "no-messages") return { reply: "未找到当前对话者的消息" };
+      return { reply: `已清除当前对话者的 ${res.removedCount} 条消息` };
+    },
+  },
+  {
     name: "rc",
     description: "接管桌面会话（远程遥控）",
     scope: "session",
