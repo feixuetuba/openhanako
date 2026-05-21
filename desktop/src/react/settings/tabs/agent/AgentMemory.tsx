@@ -418,15 +418,17 @@ export function SystemPromptSections() {
   };
 
   const toggleSection = (key: string, enabled: boolean) => {
-    const lines = rawContent.split('\n');
-    const headerRegex = new RegExp(`^##\\s+!?${key}\\s*$`);
-    for (let i = 0; i < lines.length; i++) {
-      if (headerRegex.test(lines[i])) {
-        lines[i] = enabled ? `## ${key}` : `## !${key}`;
-        break;
+    setRawContent(prev => {
+      const lines = prev.split('\n');
+      const headerRegex = new RegExp(`^##\\s+!?${key}\\s*$`);
+      for (let i = 0; i < lines.length; i++) {
+        if (headerRegex.test(lines[i])) {
+          lines[i] = enabled ? `## ${key}` : `## !${key}`;
+          break;
+        }
       }
-    }
-    setRawContent(lines.join('\n'));
+      return lines.join('\n');
+    });
   };
 
   const hasSection = (key: string) => {
@@ -460,12 +462,12 @@ export function SystemPromptSections() {
                       type="checkbox"
                       checked={enabled}
                       onChange={(e) => {
+                        const nextEnabled = e.target.checked;
                         if (!exists) {
                           // 首次启用：添加段落
-                          const newSection = `## ${meta.key}\n`;
-                          setRawContent(prev => prev + (prev.endsWith('\n') ? '' : '\n') + newSection);
+                          setRawContent(prev => prev + (prev.endsWith('\n') ? '' : '\n') + `## ${meta.key}\n`);
                         } else {
-                          toggleSection(meta.key, e.target.checked);
+                          toggleSection(meta.key, nextEnabled);
                         }
                       }}
                     />
