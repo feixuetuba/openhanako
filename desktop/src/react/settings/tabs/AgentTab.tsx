@@ -8,7 +8,7 @@ import { SelectWidget } from '@/ui';
 import { browseAgent, switchToAgent, loadSettingsConfig, loadAgents } from '../actions';
 import { AgentCardStack } from './agent/AgentCardStack';
 import { YuanSelector } from './agent/YuanSelector';
-import { MemorySection } from './agent/AgentMemory';
+import { MemorySection, PlatformPromptSection, SystemPromptSections } from './agent/AgentMemory';
 import { AgentToolsSection } from './agent/AgentToolsSection';
 import { CharacterCardPreviewOverlay, type CharacterCardPlan } from '../overlays/CharacterCardPreviewOverlay';
 import { SettingsSection } from '../components/SettingsSection';
@@ -346,6 +346,10 @@ export function AgentTab() {
         isViewingOther={isViewingOther}
         currentPins={currentPins}
       />
+
+      <PlatformPromptSection />
+
+      <SystemPromptSections />
 
       {/* 经验 */}
       <SettingsSection title={t('settings.experience.title')}>

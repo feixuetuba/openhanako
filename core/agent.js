@@ -38,6 +38,10 @@ import { createCurrentStatusTool } from "../lib/tools/current-status-tool.js";
 import { createTerminalTool } from "../lib/tools/terminal-tool.js";
 import { runCompatChecks } from "../lib/compat/index.js";
 import { getPlatformPromptNote } from "./platform-prompt.js";
+import {
+  parseSectionsFile,
+  getSection,
+} from "./system-prompt-sections.js";
 
 export class Agent {
   /**
@@ -91,6 +95,7 @@ export class Agent {
     this._experienceTools = [];
     this._memoryMasterEnabled = true;   // agent 级别总开关（config.yaml memory.enabled）
     this._memorySessionEnabled = true;  // per-session 开关（WelcomeScreen toggle）
+    this.memoryLocked = false;        // 手动锁定编译记忆（config.yaml memory.locked）
     this._experienceEnabled = false;    // agent 级别经验能力开关（config.yaml experience.enabled，默认关闭）
     this._enabledSkills = [];
     this._systemPrompt = "";
@@ -142,6 +147,7 @@ export class Agent {
     this.agentName = this._config.agent?.name || "Hanako";
     this._memoryMasterEnabled = this._config.memory?.enabled !== false;
     this._experienceEnabled = this._config.experience?.enabled === true;
+    this.memoryLocked = this._config.memory?.locked === true;
   }
 
   async init(log = () => {}, sharedModels = {}, resolveModel = null) {
@@ -163,6 +169,7 @@ export class Agent {
     this.agentName = this._config.agent?.name || "Hanako";
     this._memoryMasterEnabled = this._config.memory?.enabled !== false;
     this._experienceEnabled = this._config.experience?.enabled === true;
+    this.memoryLocked = this._config.memory?.locked === true;
 
     // 3. 初始化各模块
     log(`  [agent] 3. 模块初始化完成`);
@@ -248,7 +255,7 @@ export class Agent {
         getResolvedMemoryModel: () => this._resolveModel(this._memoryModel, this._config),
         getMemoryMasterEnabled: () => this._memoryMasterEnabled,
         isSessionMemoryEnabled: (sessionPath) => this.isSessionMemoryEnabledFor(sessionPath),
-        getTimezone: () => this._cb?.getTimezone?.() || Intl.DateTimeFormat().resolvedOptions().timeZone,
+        isMemoryLocked: () => this.memoryLocked,
         onCompiled: () => {
           // _systemPrompt 是非 session 路径（巡检/cron/频道/DM/bridge owner 新建）
           // 共享的 cache，必须按 master 构建，不被 per-session 开关污染。
@@ -451,7 +458,6 @@ export class Agent {
       },
       resolveUtilityModel: () => this._cb?.getCurrentModelId?.() || null,
       getDeferredStore: () => this._cb?.getDeferredResults?.(),
-      getSubagentRunStore: () => this._cb?.getSubagentRunStore?.(),
       getTaskRegistry: () => this._cb?.getTaskRegistry?.(),
       setSubagentController: (id, ctrl) => this._cb?.setSubagentController?.(id, ctrl),
       removeSubagentController: (id) => this._cb?.removeSubagentController?.(id),
@@ -714,6 +720,9 @@ export class Agent {
     if (partial.memory && "enabled" in partial.memory) {
       this._memoryMasterEnabled = this._config.memory?.enabled !== false;
     }
+    if (partial.memory && "locked" in partial.memory) {
+      this.memoryLocked = this._config.memory?.locked === true;
+    }
     if (partial.experience && "enabled" in partial.experience) {
       this._experienceEnabled = this._config.experience?.enabled === true;
     }
@@ -814,7 +823,7 @@ export class Agent {
    * @param {boolean} [options.forSubagent] - 为 subagent 构造的轻量 prompt：
    *   跳过记忆三段（规则 + pinned.md + memory.md）和团队 agent 名单。
    *   Subagent 是一次性隔离任务，不需要长期记忆和多 agent 协作上下文。
-   * @param {string} [options.cwdOverride] - 覆盖 prompt 中“工作台”章节展示的 cwd。
+   * @param {string} [options.cwdOverride] - 覆盖 prompt 中“工作空间”章节展示的 cwd。
    *   用于新建隔离 session 时，让 prompt 快照和实际执行目录保持一致。
    */
   buildSystemPrompt(options = {}) {
@@ -843,8 +852,9 @@ export class Agent {
     if (!this._readYuan()) throw new Error(`Cannot find yuan "${yuanType}". Check lib/yuan/`);
     const ishiki = this.personality;
 
-    // 可选文件
-    const userMd = readFile(path.join(this.userDir, "user.md"));
+    // 可选文件 — per-agent 优先，fallback 全局
+    const userMd = readFile(path.join(this.agentDir, "user-profile.md"))
+      || readFile(path.join(this.userDir, "user.md"));
     const pinnedMd = readFile(path.join(this.agentDir, "pinned.md"));
     const memory = readFile(this.memoryMdPath);
 
@@ -855,7 +865,7 @@ export class Agent {
     // cache 命中率（KV cache / Anthropic prompt cache 都按严格前缀匹配）。
     // 顺序：平台 → 环境 → 行为指南（任务/经验/工具/安全/网页/设置/技能/团队）
     //      ── cache 分界线 ──
-    //      用户档案 → ishiki（依赖 userName）→ 工作台 → 记忆规则/置顶/记忆 → 当前时间
+    //      用户档案 → ishiki（依赖 userName）→ 工作空间 → 记忆规则/置顶/记忆 → 当前时间
     //
     // ishiki 放在用户档案之后：模板里有「你和{userName}是认识很久的人」这类引用，
     // 叙事顺序上先告诉模型"用户是谁"，再告诉它"你是谁、你和用户什么关系"。
@@ -864,7 +874,19 @@ export class Agent {
         ? "你运行在 OpenHanako 平台上，由 liliMozi 开发。项目主页：https://github.com/liliMozi/openhanako"
         : "You are running on the OpenHanako platform, developed by liliMozi. Project page: https://github.com/liliMozi/openhanako",
     ];
-    const platformPrompt = getPlatformPromptNote({ platform: process.platform });
+
+    // 读取用户自定义的 system-prompt-sections.md
+    const sectionsContent = readFile(path.join(this.agentDir, "system-prompt-sections.md"));
+    const userSections = parseSectionsFile(sectionsContent);
+
+    // 辅助：获取段落，优先用户自定义，fallback 默认
+    const s = (key, zhDefault, enDefault) => {
+      const fallback = isZh ? zhDefault : enDefault;
+      return getSection(key, userSections, this._config.locale, fallback);
+    };
+
+    const platformPrompt = readFile(path.join(this.agentDir, "platform-prompt.md"))
+      || getPlatformPromptNote({ platform: process.platform });
     if (platformPrompt) {
       parts.push(...section(
         isZh ? "# 执行环境" : "# Environment",
@@ -928,17 +950,15 @@ export class Agent {
     // 显示路径（GET /system-prompt）会自行拼接 skills 以保持开发者视图一致。
 
     // 任务管理引导（todo_write 工具主动使用）
-    parts.push(isZh
-      ? "\n## 任务管理\n\n" +
-        "用 todo_write 工具拆分和追踪你的工作。收到复杂或多步骤的任务时，先拆分为子任务再逐步执行。\n\n" +
+    const taskMgmt = s("task-management",
+      "用 todo_write 工具拆分和追踪你的工作。收到复杂或多步骤的任务时，先拆分为子任务再逐步执行。\n\n" +
         "**每次调用都传入完整的 todos 列表**（替换式），每条 todo 必须包含：\n" +
         "- content：静态描述，如『读取 spec』\n" +
         "- activeForm：执行中态描述，如『正在读取 spec』\n" +
         "- status：pending | in_progress | completed\n\n" +
         "**约定同时最多一条 in_progress**。开始一条时标 in_progress，完成后立即改 completed 并把下一条改 in_progress，不要攒着批量标记。\n" +
-        "这能帮助用户了解你的进度。简单的单步任务（回答问题、单次查询、简单修改）不需要 todo_write。"
-      : "\n## Task Management\n\n" +
-        "Use the todo_write tool to break down and track your work. When you receive complex or multi-step tasks, decompose them into sub-tasks before executing step by step.\n\n" +
+        "这能帮助用户了解你的进度。简单的单步任务（回答问题、单次查询、简单修改）不需要 todo_write。",
+      "Use the todo_write tool to break down and track your work. When you receive complex or multi-step tasks, decompose them into sub-tasks before executing step by step.\n\n" +
         "**Each call replaces the entire todos list** (replacement-style). Each todo must include:\n" +
         "- content: static description, e.g. 'Read spec'\n" +
         "- activeForm: in-progress description, e.g. 'Reading spec'\n" +
@@ -946,20 +966,19 @@ export class Agent {
         "**Convention: at most one in_progress at a time**. Mark a todo in_progress when starting it, immediately change it to completed when done and set the next one to in_progress — do not batch up completions.\n" +
         "This helps the user track your progress. Simple single-step tasks (answering questions, single lookups, simple edits) do not need todo_write."
     );
+    if (taskMgmt !== null) parts.push("\n## " + (isZh ? "任务管理" : "Task Management") + "\n\n" + taskMgmt);
 
     // 经验库引导。经验是独立能力：缺省关闭，开启后才把规则写入新 session 的 prompt。
     if (experienceEnabled) {
-      parts.push(isZh
-        ? "\n## 经验库\n\n" +
-          "你有一个经验库，记录着过往工作中踩过的坑和学到的教训。\n\n" +
+      const exp = s("experience-library",
+        "你有一个经验库，记录着过往工作中踩过的坑和学到的教训。\n\n" +
           "**查**：接到工作任务时，先调用 recall_experience 扫一眼索引，看有没有相关经验。\n\n" +
           "**记**：工作中遇到以下情况时，用 record_experience 记录一条简洁的教训：\n" +
           "- 用户纠正了你的错误\n" +
           "- 用户表现出不满或反复强调某件事\n" +
           "- 你自己试错后找到了正确做法\n" +
-          "- 巡检或自主工作时踩了坑"
-        : "\n## Experience Library\n\n" +
-          "You have an experience library that stores lessons from past work — mistakes, corrections, and discoveries.\n\n" +
+          "- 巡检或自主工作时踩了坑",
+        "You have an experience library that stores lessons from past work — mistakes, corrections, and discoveries.\n\n" +
           "**Recall**: When you receive a work task, call recall_experience to scan the index for relevant experience first.\n\n" +
           "**Record**: During work, use record_experience to log a concise lesson when:\n" +
           "- The user corrects a mistake you made\n" +
@@ -967,39 +986,32 @@ export class Agent {
           "- You discover the right approach after trial and error\n" +
           "- You hit a pitfall during patrol or autonomous work"
       );
+      if (exp !== null) parts.push("\n## " + (isZh ? "经验库" : "Experience Library") + "\n\n" + exp);
     }
 
     // 工具使用纪律（轻量优先）
-    parts.push(isZh
-      ? "\n## 工具使用纪律\n\n" +
-        "当多个工具能完成同一件事时，优先使用成本最低、干扰最小的那个。" +
-        "不要在简单工具能解决问题的场景下启动重型工具。"
-      : "\n## Tool Usage Discipline\n\n" +
-        "When multiple tools can accomplish the same task, prefer the one with the lowest cost and least disruption. " +
-        "Do not reach for heavy tools when simpler ones can do the job."
+    const toolDisc = s("tool-discipline",
+      "当多个工具能完成同一件事时，优先使用成本最低、干扰最小的那个。不要在简单工具能解决问题的场景下启动重型工具。",
+      "When multiple tools can accomplish the same task, prefer the one with the lowest cost and least disruption. Do not reach for heavy tools when simpler ones can do the job."
     );
+    if (toolDisc !== null) parts.push("\n## " + (isZh ? "工具使用纪律" : "Tool Usage Discipline") + "\n\n" + toolDisc);
 
-    parts.push(isZh
-      ? "\n## 当前视野\n\n" +
-        "用户界面有一份可查询的当前视野，包括当前浏览目录、主面板打开内容和钉住窗口。" +
-        "用户用“这个、这里、当前、打开的、选中的、钉住的、当前文件、当前文件夹”等说法指向界面时，先调用 current_status 获取 ui_context，再继续处理任务。"
-      : "\n## Current View\n\n" +
-        "The user interface has queryable current-view state, including the current viewed folder, main-panel content, and pinned viewer windows. " +
-        "When the user says things like this, here, current, open, selected, pinned, current file, or current folder to refer to the UI, call current_status for ui_context first, then continue the task."
+    const currentView = s("current-view",
+      "用户界面有一份可查询的当前视野，包括当前浏览目录、主面板打开内容和钉住窗口。用户用「这个、这里、当前、打开的、选中的、钉住的、当前文件、当前文件夹」等说法指向界面时，先调用 current_status 获取 ui_context，再继续处理任务。",
+      "The user interface has queryable current-view state, including the current viewed folder, main-panel content, and pinned viewer windows. When the user says things like this, here, current, open, selected, pinned, current file, or current folder to refer to the UI, call current_status for ui_context first, then continue the task."
     );
+    if (currentView !== null) parts.push("\n## " + (isZh ? "当前视野" : "Current View") + "\n\n" + currentView);
 
-    parts.push(isZh
-      ? "\n## Session 文件与交付\n\n" +
-        "SessionFile 表示和当前 session 相关的本地文件：用户上传/附加的文件、你通过 write 创建的文件、你通过 edit 修改的文件、插件产物、浏览器截图、安装产物都会进入同一套 session 文件记录。\n\n" +
+    const sessionFiles = s("session-files",
+      "SessionFile 表示和当前 session 相关的本地文件：用户上传/附加的文件、你通过 write 创建的文件、你通过 edit 修改的文件、插件产物、浏览器截图、安装产物都会进入同一套 session 文件记录。\n\n" +
         "当你需要使用本轮会话已经产生或登记过的文件时，先调用 current_status 获取 session_files。它会返回当前 session 的文件清单、fileId、来源、状态和本机路径。不要猜测 session-files 缓存路径。\n\n" +
         "write/edit 成功后会由工具层自动记录为 session 相关文件；这只表示文件和本次会话有关，不等于已经交付给用户。\n\n" +
         "当用户要求你把文件发给他、呈现给他、交付给他，或者你创建/修改了一个明确需要用户查看或拿走的文件时，使用 stage_files 标记为已交付。stage 表示把这个 session 相关文件提升为消费端可展示/可发送的文件；桌面端可以显示卡片，Bridge 可以按平台能力发送，未来移动端也消费同一份 SessionFile。\n\n" +
         "- 只传真实存在的本机绝对路径\n" +
         "- 已经 stage 过的同一个文件不需要反复 stage；如文件内容后来又被修改，并且用户需要查看最新版本，再 stage 一次\n" +
         "- 不要只在文本里写文件路径\n" +
-        "- 不要在 Agent 层判断具体平台怎么展示或发送，消费端会处理"
-      : "\n## Session Files and Delivery\n\n" +
-        "SessionFile means a local file related to the current session: files uploaded or attached by the user, files you create with write, files you modify with edit, plugin outputs, browser screenshots, and install outputs all enter the same session file record.\n\n" +
+        "- 不要在 Agent 层判断具体平台怎么展示或发送，消费端会处理",
+      "SessionFile means a local file related to the current session: files uploaded or attached by the user, files you create with write, files you modify with edit, plugin outputs, browser screenshots, and install outputs all enter the same session file record.\n\n" +
         "When you need to use a file that has already been produced or registered in this conversation, call current_status with the session_files key first. It returns the current session file list, fileId, origin, status, and local path. Do not guess session-files cache paths.\n\n" +
         "After write/edit succeeds, the tool layer records the file as session-related automatically; this only means the file belongs to this session, not that it has been delivered to the user.\n\n" +
         "When the user asks you to send, present, or hand over a file, or when you create/modify a file the user clearly needs to see or take away, use stage_files to mark it as delivered. Staging promotes this session-related file to something consumers can display/send; desktop can render a card, Bridge can send according to platform capabilities, and future mobile clients can consume the same SessionFile.\n\n" +
@@ -1008,75 +1020,60 @@ export class Agent {
         "- Do not merely write file paths in text\n" +
         "- Do not decide platform-specific display or sending behavior in the Agent layer; consumers handle it"
     );
+    if (sessionFiles !== null) parts.push("\n## " + (isZh ? "Session 文件与交付" : "Session Files and Delivery") + "\n\n" + sessionFiles);
 
     if (this._isComputerUseAvailableForThisAgent()) {
-      parts.push(isZh
-        ? "\n## 本机应用控制\n\n" +
-          "用户要求打开、查看、点击、输入或控制本机 GUI 应用时，优先使用 computer 工具。" +
-          "不要用 bash、AppleScript、osascript、open -a 或平台脚本控制 GUI 应用；这些路径会绕过 Hana 的应用审批列表，也更容易撞到系统隐私权限。" +
-          "如果需要控制一个新应用，先用 computer 的 start/list_apps 流程触发应用级确认，让用户在输入框上方同意。"
-        : "\n## Desktop App Control\n\n" +
-          "When the user asks to open, inspect, click, type in, or control a local GUI application, prefer the computer tool. " +
-          "Do not use bash, AppleScript, osascript, open -a, or platform scripts to control GUI applications; those paths bypass Hana's app approval list and are more likely to hit OS privacy permissions. " +
-          "For a new app, use the computer start/list_apps flow so the input-area app approval prompt can ask the user to approve it."
+      const compUse = s("computer-use",
+        "用户要求打开、查看、点击、输入或控制本机 GUI 应用时，优先使用 computer 工具。不要用 bash、AppleScript、osascript、open -a 或平台脚本控制 GUI 应用；这些路径会绕过 Hana 的应用审批列表，也更容易撞到系统隐私权限。如果需要控制一个新应用，先用 computer 的 start/list_apps 流程触发应用级确认，让用户在输入框上方同意。",
+        "When the user asks to open, inspect, click, type in, or control a local GUI application, prefer the computer tool. Do not use bash, AppleScript, osascript, open -a, or platform scripts to control GUI applications; those paths bypass Hana's app approval list and are more likely to hit OS privacy permissions. For a new app, use the computer start/list_apps flow so the input-area app approval prompt can ask the user to approve it."
       );
+      if (compUse !== null) parts.push("\n## " + (isZh ? "本机应用控制" : "Desktop App Control") + "\n\n" + compUse);
     }
 
     // 失败处理（诊断优先于换方案）
-    parts.push(isZh
-      ? "\n## 失败处理\n\n" +
-        "方案失败时，先诊断原因再换方向：读错误信息、检查假设、尝试针对性修复。" +
-        "不要盲目重试同一动作，也不要一次失败就彻底放弃一个可行方案。"
-      : "\n## Failure Handling\n\n" +
-        "When an approach fails, diagnose why before switching tactics — read the error, check your assumptions, try a focused fix. " +
-        "Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either."
+    const failHandle = s("failure-handling",
+      "方案失败时，先诊断原因再换方向：读错误信息、检查假设、尝试针对性修复。不要盲目重试同一动作，也不要一次失败就彻底放弃一个可行方案。",
+      "When an approach fails, diagnose why before switching tactics — read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either."
     );
+    if (failHandle !== null) parts.push("\n## " + (isZh ? "失败处理" : "Failure Handling") + "\n\n" + failHandle);
 
     // 操作安全（可逆性判断框架）
-    parts.push(isZh
-      ? "\n## 操作安全\n\n" +
-        "执行操作前，考虑可逆性和影响范围。本地的、可撤销的操作可以直接执行。" +
-        "但对于难以撤销、影响外部系统、或可能造成破坏的操作（删除文件、发送消息到外部服务、修改他人可见的状态），先向用户确认再执行。" +
-        "暂停确认的代价很低，误操作的代价可能很高。"
-      : "\n## Action Safety\n\n" +
-        "Before taking actions, consider reversibility and blast radius. Local, reversible actions can be taken freely. " +
-        "But for actions that are hard to reverse, affect external systems, or could be destructive (deleting files, sending messages to external services, modifying state visible to others), check with the user before proceeding. " +
-        "The cost of pausing to confirm is low; the cost of an unwanted action can be very high."
+    const actionSafe = s("action-safety",
+      "执行操作前，考虑可逆性和影响范围。本地的、可撤销的操作可以直接执行。但对于难以撤销、影响外部系统、或可能造成破坏的操作（删除文件、发送消息到外部服务、修改他人可见的状态），先向用户确认再执行。暂停确认的代价很低，误操作的代价可能很高。",
+      "Before taking actions, consider reversibility and blast radius. Local, reversible actions can be taken freely. But for actions that are hard to reverse, affect external systems, or could be destructive (deleting files, sending messages to external services, modifying state visible to others), check with the user before proceeding. The cost of pausing to confirm is low; the cost of an unwanted action can be very high."
     );
+    if (actionSafe !== null) parts.push("\n## " + (isZh ? "操作安全" : "Action Safety") + "\n\n" + actionSafe);
 
     // 网页工具选择优先级（跨工具编排，工具 description 里放不下）
-    parts.push(isZh
-      ? "\n## 网页工具优先级\n\n" +
-        "获取网页信息时，按以下顺序选择工具：\n" +
+    const webTools = s("web-tools",
+      "获取网页信息时，按以下顺序选择工具：\n" +
         "1. **web_search** — 查找信息、获取 URL。大多数「帮我查一下 XX」的请求用这个就够了\n" +
         "2. **web_fetch** — 已知 URL，需要提取页面文字内容。简单抓取必须用这个\n" +
         "3. **browser** — 只在以下情况使用：页面需要登录/身份验证、需要填表或点击交互、web_fetch 返回的内容为空或不完整（JS 动态渲染页面）、需要查看页面视觉布局\n\n" +
-        "**禁止**在 web_search 或 web_fetch 能完成的场景下启动浏览器。浏览器启动成本高、会打开窗口干扰用户。"
-      : "\n## Web Tool Priority\n\n" +
-        "When fetching web information, choose tools in this order:\n" +
+        "**禁止**在 web_search 或 web_fetch 能完成的场景下启动浏览器。浏览器启动成本高、会打开窗口干扰用户。",
+      "When fetching web information, choose tools in this order:\n" +
         "1. **web_search** — Find information, get URLs. Most \"look up XX\" requests are handled by this alone\n" +
         "2. **web_fetch** — Known URL, need to extract page text. Simple scraping must use this\n" +
         "3. **browser** — Only use when: the page requires login/authentication, form filling or click interaction is needed, web_fetch returns empty or incomplete content (JS-rendered pages), or you need to see visual layout\n\n" +
         "**Do not** launch the browser when web_search or web_fetch can do the job. Browser startup is expensive and opens a window that interrupts the user."
     );
+    if (webTools !== null) parts.push("\n## " + (isZh ? "网页工具优先级" : "Web Tool Priority") + "\n\n" + webTools);
 
     // 设置工具路由
-    parts.push(isZh
-      ? "\n## 设置修改\n\n" +
-        "用户提到修改设置而未指明具体软件时，默认指本应用的设置。\n" +
-        "用户要求修改偏好设置（包括但不限于：外观主题、语言地区、模型选择、安全权限、记忆功能、个人信息、工作目录）时，使用 update_settings 工具。不要搜索网页，不要编辑配置文件。意图明确时直接 apply，不确定时先 search。"
-      : "\n## Settings Changes\n\n" +
-        "When the user mentions changing settings without specifying a particular application, assume they mean this application.\n" +
+    const settingsChange = s("settings-changes",
+      "用户提到修改设置而未指明具体软件时，默认指本应用的设置。\n" +
+        "用户要求修改偏好设置（包括但不限于：外观主题、语言地区、模型选择、安全权限、记忆功能、个人信息、工作目录）时，使用 update_settings 工具。不要搜索网页，不要编辑配置文件。意图明确时直接 apply，不确定时先 search。",
+      "When the user mentions changing settings without specifying a particular application, assume they mean this application.\n" +
         "When the user asks to change preferences (including but not limited to: appearance/theme, language/region, model selection, security/permissions, memory, personal info, working directory), use the update_settings tool. Do not search the web or edit config files. When intent is clear, apply directly; when unsure, search first."
     );
+    if (settingsChange !== null) parts.push("\n## " + (isZh ? "设置修改" : "Settings Changes") + "\n\n" + settingsChange);
 
     // 主动技能获取引导（仅在 allow_github_fetch 开启时注入）
     // learn_skills 从全局 preferences 读取
     const learnCfg = this._cb?.getLearnSkills?.() || this._config?.capabilities?.learn_skills || {};
     if (learnCfg.enabled && learnCfg.allow_github_fetch) {
-      parts.push(isZh
-        ? "\n## 主动技能获取\n\n" +
-          "遇到专业领域任务且你没有对应技能时，主动搜索并安装。\n\n" +
+      const skillAcq = s("skill-acquisition",
+        "遇到专业领域任务且你没有对应技能时，主动搜索并安装。\n\n" +
           "### 搜索\n\n" +
           "1. `site:clawhub.ai {关键词}` 或 `site:github.com/openclaw/skills {关键词}`\n" +
           "2. GitHub 上其他含 SKILL.md 的仓库\n" +
@@ -1088,9 +1085,8 @@ export class Agent {
           "### 行为\n\n" +
           "- 找到后简要告知用户，直接安装并立即应用\n" +
           "- 安装失败则尝试自己完成\n" +
-          "- 搜索无果正常完成，不反复尝试"
-        : "\n## Proactive Skill Acquisition\n\n" +
-          "When you encounter specialized tasks and lack a matching skill, proactively search and install one.\n\n" +
+          "- 搜索无果正常完成，不反复尝试",
+        "When you encounter specialized tasks and lack a matching skill, proactively search and install one.\n\n" +
           "### Search\n\n" +
           "1. `site:clawhub.ai {keywords}` or `site:github.com/openclaw/skills {keywords}`\n" +
           "2. Other GitHub repos containing SKILL.md\n" +
@@ -1104,6 +1100,7 @@ export class Agent {
           "- If installation fails, attempt the task yourself\n" +
           "- If nothing found, complete normally — don't retry"
       );
+      if (skillAcq !== null) parts.push("\n## " + (isZh ? "主动技能获取" : "Proactive Skill Acquisition") + "\n\n" + skillAcq);
     }
 
     // 团队协作（仅当存在其他 agent 时注入）
@@ -1120,18 +1117,17 @@ export class Agent {
           const nameLabel = a.name && a.name !== a.id ? `（${a.name}）` : "";
           return `- \`${a.id}\`${nameLabel}${tag}${model}${desc}`;
         }).join("\n");
-        parts.push(isZh
-          ? `\n## 团队\n\n` +
-            `你不是独自工作。当前环境中有多个 agent，各有不同的专长和模型：\n\n${roster}\n\n` +
-            `调用 subagent 或 dm 工具时，agent 参数必须传上面反引号里的 id 字段值，不是括号里的显示名。\n` +
-            `遇到明显更适合其他 agent 专长的任务，或需要不同视角审核重要结论时，用 subagent 并指定 agent 参数请求协助。` +
-            `先判断这件事自己做合不合适，再决定是否交出去。不确定找谁时传 \`agent="?"\` 查看详情。`
-          : `\n## Team\n\n` +
-            `You are not working alone. Multiple agents are available, each with different strengths and models:\n\n${roster}\n\n` +
-            `When calling subagent or dm tools, the agent parameter must be the id field value shown in backticks above, not the display name in parentheses.\n` +
-            `When a task clearly falls within another agent's expertise, or when an important conclusion would benefit from a different perspective, use subagent with the agent parameter to request help. ` +
-            `Judge whether you're the best fit for the job before deciding to delegate. Pass \`agent="?"\` if unsure who to ask.`
+        const team = s("team",
+          "你不是独自工作。当前环境中有多个 agent，各有不同的专长和模型：\n\n" + roster + "\n\n" +
+            "调用 subagent 或 dm 工具时，agent 参数必须传上面反引号里的 id 字段值，不是括号里的显示名。\n" +
+            "遇到明显更适合其他 agent 专长的任务，或需要不同视角审核重要结论时，用 subagent 并指定 agent 参数请求协助。" +
+            "先判断这件事自己做合不合适，再决定是否交出去。不确定找谁时传 `agent=\"?\"` 查看详情。",
+          "You are not working alone. Multiple agents are available, each with different strengths and models:\n\n" + roster + "\n\n" +
+            "When calling subagent or dm tools, the agent parameter must be the id field value shown in backticks above, not the display name in parentheses.\n" +
+            "When a task clearly falls within another agent's expertise, or when an important conclusion would benefit from a different perspective, use subagent with the agent parameter to request help. " +
+            "Judge whether you're the best fit for the job before deciding to delegate. Pass `agent=\"?\"` if unsure who to ask."
         );
+        if (team !== null) parts.push("\n## " + (isZh ? "团队" : "Team") + "\n\n" + team);
       }
     }
 
@@ -1151,25 +1147,23 @@ export class Agent {
     // 放在用户档案之后：先建立"用户是谁"的语境，再讲"你是谁、你和用户什么关系"。
     parts.push(ishiki);
 
-    // 工作台 = 当前工作目录（注入实际路径）
+    // 工作空间 = 当前工作目录（注入实际路径）
     const cwdPath = cwdOverride !== null ? cwdOverride : (this._cb?.getCwd?.() || "");
-    parts.push(isZh
-      ? `\n## 工作台\n\n` +
-        `用户所说的「工作台」指的是当前工作目录（cwd）。` +
+    const workspace = s("workspace",
+      "用户所说的「工作空间」指的是当前工作目录（cwd）。" +
         (cwdPath ? `\n当前工作目录：${cwdPath}` : "") +
-        `\n用户提到的文件、目录默认在当前工作目录下查找。`
-      : `\n## Workspace\n\n` +
-        `When the user says "workspace", they mean the current working directory (cwd).` +
+        "\n用户提到的文件、目录默认在当前工作目录下查找。",
+      "When the user says \"workspace\", they mean the current working directory (cwd)." +
         (cwdPath ? `\nCurrent working directory: ${cwdPath}` : "") +
-        `\nFiles and directories mentioned by the user should be searched in the current working directory first.`
+        "\nFiles and directories mentioned by the user should be searched in the current working directory first."
     );
+    if (workspace !== null) parts.push("\n## " + (isZh ? "工作空间" : "Workspace") + "\n\n" + workspace);
 
-    parts.push(isZh
-      ? "\n## 技能文件身份\n\n" +
-        "技能的运行时位置可能是会话冻结的源文件指针，也可能是旧会话遗留的快照副本。指针只冻结本次会话可见的技能身份；如果源文件已不存在，该技能视为不可用。`sessions/.skill-snapshots` 与 `session-files` 下的技能副本不是源文件，不能编辑。用户要求修改技能时，先定位真实源文件：工作台技能通常在当前工作目录的 `.agents/skills/<name>/SKILL.md`；安装后的用户技能或自学技能以安装工具返回的 `skill_source` 为准。找不到源文件时显式说明。"
-      : "\n## Skill File Identity\n\n" +
-        "A skill's runtime location may be a per-session source pointer, or a legacy snapshot copy from older sessions. A pointer freezes only the skill identity visible to this session; if the source file no longer exists, that skill is unavailable. Skill copies under `sessions/.skill-snapshots` and `session-files` are not source files and must not be edited. When the user asks to modify a skill, locate the real source file first: workspace skills usually live at `.agents/skills/<name>/SKILL.md` under the current working directory; installed user or learned skills should use the `skill_source` returned by install tools. If the source cannot be resolved, say so explicitly."
+    const skillFile = s("skill-file-identity",
+      "技能的运行时位置可能是会话冻结的源文件指针，也可能是旧会话遗留的快照副本。指针只冻结本次会话可见的技能身份；如果源文件已不存在，该技能视为不可用。`sessions/.skill-snapshots` 与 `session-files` 下的技能副本不是源文件，不能编辑。用户要求修改技能时，先定位真实源文件：工作区技能通常在当前工作目录的 `.agents/skills/<name>/SKILL.md`；安装后的用户技能或自学技能以安装工具返回的 `skill_source` 为准。找不到源文件时显式说明。",
+      "A skill's runtime location may be a per-session source pointer, or a legacy snapshot copy from older sessions. A pointer freezes only the skill identity visible to this session; if the source file no longer exists, that skill is unavailable. Skill copies under `sessions/.skill-snapshots` and `session-files` are not source files and must not be edited. When the user asks to modify a skill, locate the real source file first: workspace skills usually live at `.agents/skills/<name>/SKILL.md` under the current working directory; installed user or learned skills should use the `skill_source` returned by install tools. If the source cannot be resolved, say so explicitly."
     );
+    if (skillFile !== null) parts.push("\n## " + (isZh ? "技能文件身份" : "Skill File Identity") + "\n\n" + skillFile);
 
     // 记忆规则 + 置顶记忆 + 记忆（动态，后台 compile 会更新；按 session 快照）
     if (memoryBlock) {

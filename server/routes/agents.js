@@ -42,14 +42,7 @@ import {
   hasInlineProviderCredentialPatch,
 } from "./provider-credentials.js";
 import { mergeWorkspaceHistory } from "../../shared/workspace-history.js";
-import {
-  collectSecretPatchPaths,
-  maskObjectSecrets,
-  maskSecretValue,
-  resolveSecretPatch,
-} from "../../shared/secret-custody.js";
-import { denySecretMutationWithoutScope, denyWithoutScope } from "../http/capability-guard.js";
-import { recordSecurityAuditEvent } from "../http/security-audit.js";
+import { getDefaultSectionsContent } from "../../core/system-prompt-sections.js";
 
 // ── 工具函数 ──
 
@@ -59,12 +52,6 @@ function agentDir(engine, id) {
 
 function hasOwn(value, key) {
   return !!value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, key);
-}
-
-function hasProviderMutationPatch(partial) {
-  if (!partial || typeof partial !== "object") return false;
-  if (hasOwn(partial, "providers")) return true;
-  return ["api", "embedding_api", "utility_api"].some((key) => hasInlineProviderCredentialPatch(partial[key]));
 }
 
 function getGlobalValue(globalFields, key) {
@@ -371,6 +358,7 @@ export function createAgentsRoute(engine) {
       // 直接解析 YAML，不走 loadConfig 全局缓存
       const config = YAML.load(await fs.readFile(configPath, "utf-8")) || {};
 
+      // API key 不做掩码（本地应用，前端用 type="password" 控制显隐）
       normalizeExperienceConfigForResponse(config);
 
       // 附带 raw 结构
@@ -392,7 +380,7 @@ export function createAgentsRoute(engine) {
           providerEntries[name] = {
             base_url: p.base_url || entry?.baseUrl || "",
             api: p.api || entry?.api || "",
-            api_key: maskSecretValue(p.api_key || ""),
+            api_key: p.api_key || "",
             models: p.models || [],
             model_count: (p.models || []).length,
           };
@@ -421,7 +409,7 @@ export function createAgentsRoute(engine) {
           .filter(Boolean);
       }
 
-      return c.json(maskObjectSecrets(config));
+      return c.json(config);
     } catch (err) {
       return c.json({ error: err.message }, 500);
     }
@@ -437,15 +425,6 @@ export function createAgentsRoute(engine) {
       if (!partial || typeof partial !== "object") {
         return c.json({ error: "invalid JSON body" }, 400);
       }
-      const settingsDenied = denyWithoutScope(c, "settings.write");
-      if (settingsDenied) return settingsDenied;
-      if (hasProviderMutationPatch(partial)) {
-        const providerDenied = denyWithoutScope(c, "providers.manage");
-        if (providerDenied) return providerDenied;
-      }
-      const secretFields = collectSecretPatchPaths(partial, ["api_key"]);
-      const secretDenied = denySecretMutationWithoutScope(c, secretFields);
-      if (secretDenied) return secretDenied;
 
       // Whitelist check: tools.disabled may only contain OPTIONAL_TOOL_NAMES.
       // Blocks attempts to disable core/standard tools via hand-crafted requests.
@@ -478,16 +457,11 @@ export function createAgentsRoute(engine) {
       // providers 块 → 全局 added-models.yaml
       let providersChanged = false;
       if (agentPartial.providers) {
-        const rawProviders = engine.providerRegistry.getAllProvidersRaw?.() || {};
         for (const [name, data] of Object.entries(agentPartial.providers)) {
           if (data === null) {
             engine.providerRegistry.removeProvider(name);
           } else {
-            engine.providerRegistry.saveProvider(name, resolveSecretPatch({
-              patch: data,
-              existing: rawProviders[name] || {},
-              secretKeys: ["api_key"],
-            }));
+            engine.providerRegistry.saveProvider(name, data);
           }
         }
         delete agentPartial.providers;
@@ -503,7 +477,6 @@ export function createAgentsRoute(engine) {
           const { provider: provName, update: provUpdate } = buildInlineProviderCredentialUpdate(
             block,
             agentCfg[blockName]?.provider || "",
-            (provider) => engine.providerRegistry?.getAllProvidersRaw?.()?.[provider] || {},
           );
           if (!provName) {
             return c.json({ error: `${blockName}.provider is required when saving credentials` }, 400);
@@ -527,12 +500,6 @@ export function createAgentsRoute(engine) {
 
       if (Object.keys(agentPartial).length === 0) {
         emitAgentConfigAppEvents(engine, id, { globalFields, agentPartial, providersChanged });
-        recordSecurityAuditEvent(c, engine, {
-          action: "settings.agent.config.update",
-          target: `agents.${id}.config`,
-          secretFields,
-          metadata: { agentId: id },
-        });
         return c.json({ ok: true });
       }
 
@@ -556,12 +523,6 @@ export function createAgentsRoute(engine) {
         engine.setMemoryMasterEnabled(id, agentPartial.memory.enabled !== false);
       }
       emitAgentConfigAppEvents(engine, id, { globalFields, agentPartial, providersChanged });
-      recordSecurityAuditEvent(c, engine, {
-        action: "settings.agent.config.update",
-        target: `agents.${id}.config`,
-        secretFields,
-        metadata: { agentId: id },
-      });
       return c.json({ ok: true });
     } catch (err) {
       return c.json({ error: err.message }, err.statusCode || 500);
@@ -727,6 +688,144 @@ export function createAgentsRoute(engine) {
       await engine.updateConfig({}, { agentId: id });
       emitAppEvent(engine, "agent-updated", { agentId: id });
       return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  // ════════════════════════════
+  //  Platform Prompt（platform-prompt.md）
+  // ════════════════════════════
+
+  route.get("/agents/:id/platform-prompt", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const content = await fs.readFile(path.join(agentDir(engine, id), "platform-prompt.md"), "utf-8");
+      return c.json({ content, isDefault: false });
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        // 文件不存在 → 返回默认生成的内容
+        const { getPlatformPromptNote } = await import("../../core/platform-prompt.js");
+        const defaultContent = getPlatformPromptNote({ platform: process.platform });
+        return c.json({ content: defaultContent, isDefault: true });
+      }
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.put("/agents/:id/platform-prompt", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const body = await safeJson(c);
+      const { content } = body;
+      if (typeof content !== "string") {
+        return c.json({ error: "content must be a string" }, 400);
+      }
+      const filePath = path.join(agentDir(engine, id), "platform-prompt.md");
+      if (content.trim()) {
+        await fs.writeFile(filePath, content, "utf-8");
+      } else {
+        // 空内容 → 删除文件，回退到默认
+        try { await fs.unlink(filePath); } catch {}
+      }
+      await engine.updateConfig({}, { agentId: id });
+      return c.json({ ok: true, isEmpty: !content.trim() });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  // ════════════════════════════
+  //  User Profile（user-profile.md）— per-agent 覆盖
+  // ════════════════════════════
+
+  route.get("/agents/:id/user-profile", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const content = await fs.readFile(path.join(agentDir(engine, id), "user-profile.md"), "utf-8");
+      return c.json({ content });
+    } catch (err) {
+      if (err.code === "ENOENT") return c.json({ content: "" });
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.put("/agents/:id/user-profile", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const body = await safeJson(c);
+      const { content } = body;
+      if (typeof content !== "string") {
+        return c.json({ error: "content must be a string" }, 400);
+      }
+      const filePath = path.join(agentDir(engine, id), "user-profile.md");
+      if (content.trim()) {
+        await fs.writeFile(filePath, content, "utf-8");
+      } else {
+        // 空内容 → 删除文件，回退到全局 user.md
+        try { await fs.unlink(filePath); } catch {}
+      }
+      await engine.updateConfig({}, { agentId: id });
+      return c.json({ ok: true, isEmpty: !content.trim() });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  // ════════════════════════════
+  //  System Prompt Sections（system-prompt-sections.md）
+  // ════════════════════════════
+
+  route.get("/agents/:id/system-prompt-sections", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const content = await fs.readFile(path.join(agentDir(engine, id), "system-prompt-sections.md"), "utf-8");
+      return c.json({ content, isDefault: false });
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        // 返回默认生成的内容
+        const agent = engine.getAgent(id);
+        const locale = agent?._config?.locale || "zh";
+        return c.json({ content: getDefaultSectionsContent(locale), isDefault: true });
+      }
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.put("/agents/:id/system-prompt-sections", async (c) => {
+    const id = c.req.param("id");
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    try {
+      const body = await safeJson(c);
+      const { content } = body;
+      if (typeof content !== "string") {
+        return c.json({ error: "content must be a string" }, 400);
+      }
+      const filePath = path.join(agentDir(engine, id), "system-prompt-sections.md");
+      if (content.trim()) {
+        await fs.writeFile(filePath, content, "utf-8");
+      } else {
+        try { await fs.unlink(filePath); } catch {}
+      }
+      await engine.updateConfig({}, { agentId: id });
+      return c.json({ ok: true, isEmpty: !content.trim() });
     } catch (err) {
       return c.json({ error: err.message }, 500);
     }

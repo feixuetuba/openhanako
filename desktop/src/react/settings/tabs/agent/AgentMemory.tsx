@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useSettingsStore } from '../../store';
 import { hanaFetch } from '../../api';
 import { t, autoSaveConfig, savePins } from '../../helpers';
@@ -210,5 +210,328 @@ function MemoryMoreDropdown({ isViewingOther }: { isViewingOther: boolean }) {
         </button>
       </div>
     </div>
+  );
+}
+
+// ════════════════════════════
+//  平台提示编辑器（platform-prompt.md）
+// ════════════════════════════
+
+export function PlatformPromptSection() {
+  const [content, setContent] = useState('');
+  const [isDefault, setIsDefault] = useState(true);
+  const showToast = useSettingsStore(s => s.showToast);
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const load = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      const res = await hanaFetch(`/api/agents/${aid}/platform-prompt`);
+      const data = await res.json();
+      setContent(data.content || '');
+      setIsDefault(data.isDefault !== false);
+    } catch { /* ignore */ }
+  };
+
+  const save = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      const res = await hanaFetch(`/api/agents/${aid}/platform-prompt`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setIsDefault(data.isEmpty);
+      showToast(data.isEmpty ? t('settings.platformPrompt.resetToDefault') : t('settings.saved'), 'success');
+    } catch (err: any) {
+      showToast(t('settings.saveFailed') + ': ' + err.message, 'error');
+    }
+  };
+
+  const resetToDefault = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      await hanaFetch(`/api/agents/${aid}/platform-prompt`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: '' }),
+      });
+      await load();
+      showToast(t('settings.platformPrompt.resetToDefault'), 'success');
+    } catch (err: any) {
+      showToast(t('settings.saveFailed') + ': ' + err.message, 'error');
+    }
+  };
+
+  return (
+    <SettingsSection title={t('settings.platformPrompt.title')}>
+      <div style={{ padding: 'var(--space-sm) var(--space-md)' }}>
+        <p className={styles['settings-inline-note']} style={{ marginTop: 0, marginBottom: 'var(--space-md)' }}>
+          {isDefault ? t('settings.platformPrompt.defaultHint') : t('settings.platformPrompt.customHint')}
+        </p>
+        <textarea
+          className={styles['settings-textarea']}
+          rows={4}
+          spellCheck={false}
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+        />
+        <div style={{ marginTop: 'var(--space-sm)', display: 'flex', gap: 'var(--space-sm)' }}>
+          <button className={styles['settings-save-btn-sm']} onClick={save}>
+            {t('settings.save')}
+          </button>
+          {!isDefault && (
+            <button
+              className={`${styles['memory-action-btn']} ${styles['secondary']}`}
+              onClick={resetToDefault}
+            >
+              {t('settings.platformPrompt.resetToDefault')}
+            </button>
+          )}
+        </div>
+      </div>
+    </SettingsSection>
+  );
+}
+
+// ════════════════════════════
+//  系统提示词段落编辑器（system-prompt-sections.md）
+// ════════════════════════════
+
+interface SectionDef {
+  key: string;
+  titleZh: string;
+  titleEn: string;
+}
+
+const SECTION_META: SectionDef[] = [
+  { key: 'identity', titleZh: '平台身份', titleEn: 'Identity' },
+  { key: 'task-management', titleZh: '任务管理', titleEn: 'Task Management' },
+  { key: 'experience-library', titleZh: '经验库', titleEn: 'Experience Library' },
+  { key: 'tool-discipline', titleZh: '工具使用纪律', titleEn: 'Tool Discipline' },
+  { key: 'current-view', titleZh: '当前视野', titleEn: 'Current View' },
+  { key: 'session-files', titleZh: 'Session 文件与交付', titleEn: 'Session Files' },
+  { key: 'computer-use', titleZh: '本机应用控制', titleEn: 'Computer Use' },
+  { key: 'failure-handling', titleZh: '失败处理', titleEn: 'Failure Handling' },
+  { key: 'action-safety', titleZh: '操作安全', titleEn: 'Action Safety' },
+  { key: 'web-tools', titleZh: '网页工具优先级', titleEn: 'Web Tools' },
+  { key: 'settings-changes', titleZh: '设置修改', titleEn: 'Settings Changes' },
+  { key: 'skill-acquisition', titleZh: '主动技能获取', titleEn: 'Skill Acquisition' },
+  { key: 'team', titleZh: '团队', titleEn: 'Team' },
+  { key: 'workspace', titleZh: '工作空间', titleEn: 'Workspace' },
+  { key: 'skill-file-identity', titleZh: '技能文件身份', titleEn: 'Skill File Identity' },
+];
+
+export function SystemPromptSections() {
+  const [rawContent, setRawContent] = useState('');
+  const [isDefault, setIsDefault] = useState(true);
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editContent, setEditContent] = useState('');
+  const showToast = useSettingsStore(s => s.showToast);
+  const isZh = (window as any).i18n?.locale?.startsWith('zh') ?? true;
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const load = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      const res = await hanaFetch(`/api/agents/${aid}/system-prompt-sections`);
+      const data = await res.json();
+      setRawContent(data.content || '');
+      setIsDefault(data.isDefault !== false);
+    } catch { /* ignore */ }
+  };
+
+  const save = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      const res = await hanaFetch(`/api/agents/${aid}/system-prompt-sections`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: rawContent }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setIsDefault(data.isEmpty);
+      showToast(data.isEmpty ? t('settings.systemPrompt.resetToDefault') : t('settings.saved'), 'success');
+    } catch (err: any) {
+      showToast(t('settings.saveFailed') + ': ' + err.message, 'error');
+    }
+  };
+
+  const resetToDefault = async () => {
+    try {
+      const aid = useSettingsStore.getState().getSettingsAgentId();
+      await hanaFetch(`/api/agents/${aid}/system-prompt-sections`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: '' }),
+      });
+      await load();
+      showToast(t('settings.systemPrompt.resetToDefault'), 'success');
+    } catch (err: any) {
+      showToast(t('settings.saveFailed') + ': ' + err.message, 'error');
+    }
+  };
+
+  const startEdit = (key: string) => {
+    // 从 rawContent 中提取该段落的内容
+    const match = rawContent.match(new RegExp(`^##\\s+!?${key}\\s*\n([\\s\\S]*?)(?=^##\\s+|$)`, 'm'));
+    setEditingKey(key);
+    setEditContent(match ? match[1].trim() : '');
+  };
+
+  const saveEdit = () => {
+    if (!editingKey) return;
+    const lines = rawContent.split('\n');
+    const headerRegex = new RegExp(`^##\\s+!?${editingKey}\\s*$`);
+    let startIdx = -1;
+    let endIdx = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+      if (headerRegex.test(lines[i])) {
+        startIdx = i;
+      } else if (startIdx !== -1 && /^##\s+/.test(lines[i])) {
+        endIdx = i;
+        break;
+      }
+    }
+
+    if (startIdx === -1) {
+      // 段落不存在，追加
+      const newSection = `## ${editingKey}\n${editContent}\n`;
+      setRawContent(prev => prev + (prev.endsWith('\n') ? '' : '\n') + newSection);
+    } else {
+      const newLines = [...lines];
+      if (endIdx === -1) endIdx = lines.length;
+      newLines.splice(startIdx + 1, endIdx - startIdx - 1, editContent);
+      setRawContent(newLines.join('\n'));
+    }
+    setEditingKey(null);
+  };
+
+  const toggleSection = (key: string, enabled: boolean) => {
+    const lines = rawContent.split('\n');
+    const headerRegex = new RegExp(`^##\\s+!?${key}\\s*$`);
+    for (let i = 0; i < lines.length; i++) {
+      if (headerRegex.test(lines[i])) {
+        lines[i] = enabled ? `## ${key}` : `## !${key}`;
+        break;
+      }
+    }
+    setRawContent(lines.join('\n'));
+  };
+
+  const hasSection = (key: string) => {
+    return new RegExp(`^##\\s+!?${key}\\s*$`, 'm').test(rawContent);
+  };
+
+  const isSectionEnabled = (key: string) => {
+    const match = rawContent.match(new RegExp(`^##\\s+(!?)${key}\\s*$`, 'm'));
+    return match ? !match[1] : true; // 不在文件中 = 默认启用
+  };
+
+  return (
+    <SettingsSection title={t('settings.systemPrompt.title')}>
+      <div style={{ padding: 'var(--space-sm) var(--space-md)' }}>
+        <p className={styles['settings-inline-note']} style={{ marginTop: 0, marginBottom: 'var(--space-md)' }}>
+          {isDefault ? t('settings.systemPrompt.defaultHint') : t('settings.systemPrompt.customHint')}
+        </p>
+
+        {/* 段落卡片列表 */}
+        <div className={styles['sections-list']}>
+          {SECTION_META.map(meta => {
+            const exists = hasSection(meta.key);
+            const enabled = isSectionEnabled(meta.key);
+            const title = isZh ? meta.titleZh : meta.titleEn;
+
+            return (
+              <div key={meta.key} className={styles['section-card']}>
+                <div className={styles['section-card-header']}>
+                  <label className={styles['section-toggle-label']}>
+                    <input
+                      type="checkbox"
+                      checked={enabled}
+                      onChange={(e) => {
+                        if (!exists) {
+                          // 首次启用：添加段落
+                          const newSection = `## ${meta.key}\n`;
+                          setRawContent(prev => prev + (prev.endsWith('\n') ? '' : '\n') + newSection);
+                        } else {
+                          toggleSection(meta.key, e.target.checked);
+                        }
+                      }}
+                    />
+                    <span className={styles['section-card-title']}>{title}</span>
+                  </label>
+                  <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
+                    <button
+                      className={`${styles['memory-action-btn']} ${styles['secondary']}`}
+                      onClick={() => startEdit(meta.key)}
+                      disabled={!enabled}
+                    >
+                      {t('common.edit')}
+                    </button>
+                  </div>
+                </div>
+                {!enabled && exists && (
+                  <span className={styles['section-disabled-note']}>
+                    {t('settings.systemPrompt.disabled')}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* 编辑弹窗 */}
+        {editingKey && (
+          <div className={styles['section-edit-overlay']}>
+            <div className={styles['section-edit-modal']}>
+              <h4>{SECTION_META.find(s => s.key === editingKey)?.[isZh ? 'titleZh' : 'titleEn'] || editingKey}</h4>
+              <textarea
+                className={styles['settings-textarea']}
+                rows={10}
+                spellCheck={false}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+              />
+              <div style={{ marginTop: 'var(--space-sm)', display: 'flex', gap: 'var(--space-sm)', justifyContent: 'flex-end' }}>
+                <button
+                  className={`${styles['memory-action-btn']} ${styles['secondary']}`}
+                  onClick={() => setEditingKey(null)}
+                >
+                  {t('common.cancel')}
+                </button>
+                <button className={styles['settings-save-btn-sm']} onClick={saveEdit}>
+                  {t('settings.save')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div style={{ marginTop: 'var(--space-md)', display: 'flex', gap: 'var(--space-sm)' }}>
+          <button className={styles['settings-save-btn-sm']} onClick={save}>
+            {t('settings.save')}
+          </button>
+          {!isDefault && (
+            <button
+              className={`${styles['memory-action-btn']} ${styles['secondary']}`}
+              onClick={resetToDefault}
+            >
+              {t('settings.systemPrompt.resetToDefault')}
+            </button>
+          )}
+        </div>
+      </div>
+    </SettingsSection>
   );
 }
