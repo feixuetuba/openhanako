@@ -8,6 +8,7 @@ import { SelectWidget } from '@/ui';
 import { browseAgent, switchToAgent, loadSettingsConfig, loadAgents } from '../actions';
 import { AgentCardStack } from './agent/AgentCardStack';
 import { YuanSelector } from './agent/YuanSelector';
+import { SystemPromptModules } from './agent/SystemPromptModules';
 import { MemorySection, PlatformPromptSection, SystemPromptSections } from './agent/AgentMemory';
 import { AgentToolsSection } from './agent/AgentToolsSection';
 import { CharacterCardPreviewOverlay, type CharacterCardPlan } from '../overlays/CharacterCardPreviewOverlay';
@@ -350,6 +351,8 @@ export function AgentTab() {
       <PlatformPromptSection />
 
       <SystemPromptSections />
+
+      <SystemPromptModules />
 
       {/* 经验 */}
       <SettingsSection title={t('settings.experience.title')}>

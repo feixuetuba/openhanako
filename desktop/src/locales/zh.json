@@ -751,6 +751,22 @@
       "lastAgent": "至少保留一个助手",
       "yuan": "元",
       "yuanHint": "「元」是助手的潜意识，以此为基础搭建你独一无二的伙伴",
+      "systemPromptModules": {
+        "title": "系统提示词模块",
+        "hint": "控制发送给 LLM 的系统提示词包含哪些内容。关闭不需要的模块可以显著减少提示词长度，适合上下文较小的本地模型。",
+        "platform": "平台信息",
+        "platformHint": "OpenHanako 平台标识和开发信息",
+        "environment": "执行环境",
+        "environmentHint": "操作系统、Shell、平台等环境信息",
+        "sections": "行为指南",
+        "sectionsHint": "任务管理、经验库、工具使用、操作安全等行为指南",
+        "skills": "技能列表",
+        "skillsHint": "已安装技能的 SKILL.md 内容（通常占用大量字符）",
+        "background_tasks": "后台任务规则",
+        "background_tasksHint": "subagent 等后台任务的处理规则",
+        "workspace": "工作区范围",
+        "workspaceHint": "当前工作目录和额外文件夹信息"
+      },
       "tools": {
         "title": "工具",
         "description": "这些工具开关会在重启对话或新建对话后生效。当前进行中的会话继续使用创建时的工具集。",

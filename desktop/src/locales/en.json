@@ -746,6 +746,22 @@
       "lastAgent": "Must keep at least one agent",
       "yuan": "Yuan",
       "yuanHint": "\"Yuan\" is the agent's subconscious. Build your unique companion from this foundation.",
+      "systemPromptModules": {
+        "title": "System Prompt Modules",
+        "hint": "Control which modules are included in the system prompt sent to the LLM. Disabling unnecessary modules can significantly reduce prompt length, ideal for local models with smaller context windows.",
+        "platform": "Platform Info",
+        "platformHint": "OpenHanako platform identification and developer info",
+        "environment": "Environment",
+        "environmentHint": "OS, shell, platform and other environment information",
+        "sections": "Behavior Guides",
+        "sectionsHint": "Task management, experience library, tool usage, action safety and other behavior guides",
+        "skills": "Skills List",
+        "skillsHint": "Installed skills' SKILL.md content (usually takes a lot of characters)",
+        "background_tasks": "Background Task Rules",
+        "background_tasksHint": "Rules for handling subagent and other background tasks",
+        "workspace": "Workspace Scope",
+        "workspaceHint": "Current working directory and extra folder information"
+      },
       "tools": {
         "title": "Tools",
         "description": "Tool switches take effect after restarting or starting a conversation. Active conversations keep using the tool set they started with.",

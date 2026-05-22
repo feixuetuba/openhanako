@@ -845,6 +845,14 @@ export class Agent {
       : this.experienceEnabled;
     const isZh = String(this._config.locale || "").startsWith("zh");
 
+    // System prompt 模块开关（从 config 读取，默认全部启用）
+    const spm = this._config?.system_prompt_modules || {};
+    const enablePlatform = spm.platform !== false;
+    const enableEnvironment = spm.environment !== false;
+    const enableSections = spm.sections !== false;
+    const enableSkills = spm.skills !== false;
+    const enableWorkspace = spm.workspace !== false;
+
     const readFile = (filePath) => safeReadFile(filePath, "");
 
     // identity + yuan + ishiki（复用 personality getter）
@@ -869,11 +877,14 @@ export class Agent {
     //
     // ishiki 放在用户档案之后：模板里有「你和{userName}是认识很久的人」这类引用，
     // 叙事顺序上先告诉模型"用户是谁"，再告诉它"你是谁、你和用户什么关系"。
-    const parts = [
-      isZh
-        ? "你运行在 OpenHanako 平台上，由 liliMozi 开发。项目主页：https://github.com/liliMozi/openhanako"
-        : "You are running on the OpenHanako platform, developed by liliMozi. Project page: https://github.com/liliMozi/openhanako",
-    ];
+    const parts = [];
+    if (enablePlatform) {
+      parts.push(
+        isZh
+          ? "你运行在 OpenHanako 平台上，由 liliMozi 开发。项目主页：https://github.com/liliMozi/openhanako"
+          : "You are running on the OpenHanako platform, developed by liliMozi. Project page: https://github.com/liliMozi/openhanako"
+      );
+    }
 
     // 读取用户自定义的 system-prompt-sections.md
     const sectionsContent = readFile(path.join(this.agentDir, "system-prompt-sections.md"));
@@ -881,13 +892,14 @@ export class Agent {
 
     // 辅助：获取段落，优先用户自定义，fallback 默认
     const s = (key, zhDefault, enDefault) => {
+      if (!enableSections) return null;
       const fallback = isZh ? zhDefault : enDefault;
       return getSection(key, userSections, this._config.locale, fallback);
     };
 
     const platformPrompt = readFile(path.join(this.agentDir, "platform-prompt.md"))
       || getPlatformPromptNote({ platform: process.platform });
-    if (platformPrompt) {
+    if (platformPrompt && enableEnvironment) {
       parts.push(...section(
         isZh ? "# 执行环境" : "# Environment",
         platformPrompt
@@ -1107,7 +1119,7 @@ export class Agent {
     // Subagent 场景下跳过：subagent 没有 subagent 工具，知道其他 agent 也使不上
     if (this._listAgents && !forSubagent) {
       const myId = this.id;
-      const allAgents = this._listAgents();
+      const allAgents = this._listAgents() || [];
       const others = allAgents.filter(a => a.id !== myId);
       if (others.length > 0) {
         const roster = allAgents.map(a => {
@@ -1149,20 +1161,20 @@ export class Agent {
 
     // 工作空间 = 当前工作目录（注入实际路径）
     const cwdPath = cwdOverride !== null ? cwdOverride : (this._cb?.getCwd?.() || "");
-    const workspace = s("workspace",
+    const workspace = enableWorkspace ? s("workspace",
       "用户所说的「工作空间」指的是当前工作目录（cwd）。" +
         (cwdPath ? `\n当前工作目录：${cwdPath}` : "") +
         "\n用户提到的文件、目录默认在当前工作目录下查找。",
       "When the user says \"workspace\", they mean the current working directory (cwd)." +
         (cwdPath ? `\nCurrent working directory: ${cwdPath}` : "") +
         "\nFiles and directories mentioned by the user should be searched in the current working directory first."
-    );
+    ) : null;
     if (workspace !== null) parts.push("\n## " + (isZh ? "工作空间" : "Workspace") + "\n\n" + workspace);
 
-    const skillFile = s("skill-file-identity",
+    const skillFile = enableSkills ? s("skill-file-identity",
       "技能的运行时位置可能是会话冻结的源文件指针，也可能是旧会话遗留的快照副本。指针只冻结本次会话可见的技能身份；如果源文件已不存在，该技能视为不可用。`sessions/.skill-snapshots` 与 `session-files` 下的技能副本不是源文件，不能编辑。用户要求修改技能时，先定位真实源文件：工作区技能通常在当前工作目录的 `.agents/skills/<name>/SKILL.md`；安装后的用户技能或自学技能以安装工具返回的 `skill_source` 为准。找不到源文件时显式说明。",
       "A skill's runtime location may be a per-session source pointer, or a legacy snapshot copy from older sessions. A pointer freezes only the skill identity visible to this session; if the source file no longer exists, that skill is unavailable. Skill copies under `sessions/.skill-snapshots` and `session-files` are not source files and must not be edited. When the user asks to modify a skill, locate the real source file first: workspace skills usually live at `.agents/skills/<name>/SKILL.md` under the current working directory; installed user or learned skills should use the `skill_source` returned by install tools. If the source cannot be resolved, say so explicitly."
-    );
+    ) : null;
     if (skillFile !== null) parts.push("\n## " + (isZh ? "技能文件身份" : "Skill File Identity") + "\n\n" + skillFile);
 
     // 记忆规则 + 置顶记忆 + 记忆（动态，后台 compile 会更新；按 session 快照）

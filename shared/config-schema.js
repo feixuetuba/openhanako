@@ -35,6 +35,12 @@ export const CONFIG_SCHEMA = {
   'bridge.readOnly':            { scope: 'global', setter: 'setBridgeReadOnly', getter: 'getBridgeReadOnly', defaultValue: false },
   'bridge.receiptEnabled':      { scope: 'global', setter: 'setBridgeReceiptEnabled', getter: 'getBridgeReceiptEnabled', defaultValue: true },
   network_proxy:                { scope: 'global', setter: 'setNetworkProxy', getter: 'getNetworkProxy' },
+  'system_prompt_modules.platform': { scope: 'agent', defaultValue: true },
+  'system_prompt_modules.environment': { scope: 'agent', defaultValue: true },
+  'system_prompt_modules.sections': { scope: 'agent', defaultValue: true },
+  'system_prompt_modules.skills': { scope: 'agent', defaultValue: true },
+  'system_prompt_modules.background_tasks': { scope: 'agent', defaultValue: true },
+  'system_prompt_modules.workspace': { scope: 'agent', defaultValue: true },
 };
 
 // 未声明的字段默认为 agent scope，不需要额外导出。
